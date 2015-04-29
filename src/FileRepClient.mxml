@@ -1,0 +1,891 @@
+<?xml version="1.0" encoding="utf-8"?>
+<core:WindowedApplicationXT xmlns:mx="http://www.adobe.com/2006/mxml" xmlns:core="core.*" xmlns:ws="ws.*"
+						layout="vertical" visible="false"
+						applicationComplete="onComplete()" 
+						activate="setFocusOnOpenWindow(event)" applicationActivate="setFocusOnOpenWindow(event)" 
+						mouseDown="setFocusOnOpenWindow(event)" mouseOver="setFocusOnOpenWindow(event)" 
+						nativeDragEnter="setFocusOnOpenWindow(event)" 
+						paddingBottom="2" paddingLeft="2" paddingRight="2" paddingTop="2"
+						statusBarFactory="com.StatusBar"
+						closeToTray="{Factory.Settings.close_to_tray}"
+						trayMenuDocked="{mnuTrayDocked}" trayMenuUndocked="{mnuTrayUndocked}" menuSelect="onMenuSelect(event, '', null)" 
+						docked="buildTooltip();" undocked="buildTooltip();"
+						showTrayIconWhenUndocked="{Factory.Settings.hide_tray_icon_while_maximized}"
+						xmlns:xt="xt.*" xmlns:views="views.*" xmlns:ns="http://ns.adobe.com/air/framework/monitor" >
+	
+	<!--
+	
+	flow:
+	
+	- start
+		
+		- hostname / webservices set?
+			- no: show settings dialog where this can be entered
+			- yes: continue
+				
+		- get host info
+		- get shares info
+			- create worker process per share
+			- per x time (per share):
+				- get fileindex
+				- check local files
+				- compare differences
+	
+	
+	
+	-->
+	
+	<mx:Script>
+		<![CDATA[
+			import com.LogFile;
+			import com.Share;
+			import com.ShareProcessIndex;
+			import com.TFactory;
+			import com.User;
+			import com.events.NativeMenuEvent;
+			import com.events.WebserviceEvent;
+			
+			import dialogs.About;
+			import dialogs.Settings;
+			import dialogs.ShareConfigDialog;
+			
+			import flash.net.navigateToURL;
+			
+			import mx.collections.ArrayCollection;
+			import mx.rpc.events.FaultEvent;
+			
+			import xt.menu.NativeMenuXT;
+			
+			
+			
+			[Bindable] public var webservicesLocation:String = '';
+			[Bindable] public var webservicesLocation2:String = '';
+			[Bindable] public var hostName:String = '';
+			[Bindable] public var startDelay:int = 0; // startup delay in seconds
+			
+			[Bindable] public var Factory:TFactory = new TFactory;
+			[Bindable] public var user:User = new User;
+			
+			[Bindable] public var shares:ArrayCollection;// = new ArrayCollection;
+			[Bindable] public var sharesActive:ArrayCollection = new ArrayCollection;
+			
+			private var dlgSettings:Settings;
+			private var dlgShareConfig:ShareConfigDialog;
+			private var dlgAbout:About;
+			
+			private var startupTimer:Timer;
+			private var runningTimer:Timer;
+			private var runningTimerIndex:int = 0;
+			
+			[Bindable] public var isSharesRunning:Boolean = false;
+			
+			private var trayIconMain:BitmapData;
+			private var trayIconError:BitmapData;
+			private var trayIconsRunning:Array = [];
+			
+			
+			[Bindable] public var inErrorMode:Boolean = false;
+			
+			
+			private function onComplete():void {
+				var loader:Loader = new Loader();
+				loader.contentLoaderInfo.addEventListener(Event.COMPLETE, onTrayIconMainLoaded, false, 0, true);
+				loader.load(new URLRequest('images/embedded/16/sync.png'));
+				
+			}
+			
+			private function onTrayIconMainLoaded(event:Event):void {
+				trayIconMain = event.target.content.bitmapData;
+				trayIcon = trayIconMain;
+				
+				var loader2:Loader = new Loader();
+				loader2.contentLoaderInfo.addEventListener(Event.COMPLETE, onTrayIconErrorLoaded, false, 0, true);
+				loader2.load(new URLRequest('images/embedded/16/sync_err.png'));
+				
+			}
+			
+			private function onTrayIconErrorLoaded(event:Event):void {
+				trayIconError = event.target.content.bitmapData;
+				loadNextTrayIcon();
+			}
+			
+			private function loadNextTrayIcon():void {
+				runningTimerIndex++;
+				var loader:Loader = new Loader();
+				loader.contentLoaderInfo.addEventListener(Event.COMPLETE, onTrayIconLoaded, false, 0, true);
+				loader.load(new URLRequest('images/embedded/16/sync_running_f' + (runningTimerIndex < 10 ? '0' : '') + runningTimerIndex + '.png'));
+				
+			}
+			
+			private function onTrayIconLoaded(event:Event):void {
+				trayIconsRunning.push(event.target.content.bitmapData);
+				
+				if(trayIconsRunning.length < 16){
+					loadNextTrayIcon();
+				}
+				else {
+					
+					buildTooltip();
+					
+					if(startDelay > 0){
+						startupTimer = new Timer(startDelay * 1000, 1);
+						startupTimer.addEventListener(TimerEvent.TIMER, continueStart, false, 0, true);
+						startupTimer.start();
+					}
+					else {
+						continueStart();
+					}
+				}
+				
+			}
+			
+			private function continueStart(event:TimerEvent = null):void {
+				if(startupTimer){
+					startupTimer.stop();
+				}
+				
+				runningTimer = new Timer(100);
+				runningTimer.addEventListener(TimerEvent.TIMER, runningTimerTick, false, 0, true);
+				runningTimer.start();
+				
+				buildMenu();
+				
+				/*
+				var cs:ChannelSet = new ChannelSet();
+				var channel:AMFChannel = new AMFChannel("my-amf", "http://nasberrypi/filerep/amfphp/gateway.php");
+				cs.addChannel(channel);
+				srvFilerep.channelSet = cs;
+				*/
+				
+				//srvFilerep.sayHello();
+				
+				//hostName = 'Wim Werkpc';
+				//webservicesLocation = 'http://wikke.dyndns.org:31480/filerep/ws.php';
+				
+				//hostName = '';
+				//webservicesLocation = '';
+				
+				/*
+				var ac:ArrayCollection = new ArrayCollection;
+				FileUtils.readDirectory(File.documentsDirectory.resolvePath('Dropbox'), ac, false);
+				
+				var ac2:ArrayCollection = FileUtils.filterModifiedAfter(ac, new Date(2013, 8, 1, 12, 0, 0));
+				
+				var f:File = ac2[0] as File;
+				
+				
+				// MD5 requires Flex 3.6
+				var fs:FileStream = new FileStream;
+				var ba:ByteArray = new ByteArray;
+				fs.open(f, FileMode.READ);
+				fs.readBytes(ba, 0, f.size);
+				fs.close();
+				var checksum:String = MD5.hashBytes(ba);
+				
+				
+				
+				// requires AIR2
+				var ft:FileTouch = new FileTouch;
+				var yesterday:Date = new Date;
+				yesterday.date--;
+				ft.setupAndLaunch(f, yesterday);
+				*/
+				
+				if(hostName == '' || webservicesLocation == ''){
+					log('No hostname or webservicelocation defined', LogFile.LEVEL_WARNING);
+					showSettings('Please specify the following data in order to continue:');
+				}
+				else {
+					getHost();
+				}
+				
+			}
+			
+			[Bindable('webservicesLocationChanged')]
+			public function get getWebservicesLocation():String {
+				return webservicesLocation;
+			}
+			
+			override public function setFocusOnOpenWindow(event:Event):void {
+				super.setFocusOnOpenWindow(event);
+				//event.preventDefault();
+				//event.stopImmediatePropagation();
+				
+				//trace('setFocusOnOpenWindow');
+				
+				// dialogs priority ordered from low to high
+				
+				if(dlgSettings				!= null && dlgSettings.visible				) dlgSettings.regetFocus(null);
+				
+				if(dlgShareConfig			!= null && dlgShareConfig.visible			) dlgShareConfig.regetFocus(null);
+				
+				//if(dlgSecurity				!= null && dlgSecurity.visible				) dlgSecurity.regetFocus(null);
+				//if(dlgPhases				!= null	&& dlgPhases.visible				) dlgPhases.regetFocus(null);
+				//if(dlgAbout					!= null	&& dlgAbout.visible					) dlgAbout.regetFocus(null);
+				//if(dlgProject				!= null	&& dlgProject.visible				) dlgProject.regetFocus(null);
+				//if(dlgDeliverable			!= null	&& dlgDeliverable.visible			) dlgDeliverable.regetFocus(null);
+				//if(dlgChangeMenu			!= null	&& dlgChangeMenu.visible			) dlgChangeMenu.regetFocus(null);
+				//if(dlgProjectDeliverable	!= null	&& dlgProjectDeliverable.visible	) dlgProjectDeliverable.regetFocus(null);
+				//if(dlgProjectPhaseComments	!= null	&& dlgProjectPhaseComments.visible	) dlgProjectPhaseComments.regetFocus(null);
+				//if(dlgProjectPhaseTasks		!= null	&& dlgProjectPhaseTasks.visible		) dlgProjectPhaseTasks.regetFocus(null);
+				//if(dlgChangePassword		!= null	&& dlgChangePassword.visible		) dlgChangePassword.regetFocus(null);
+				
+				//if(dlgUploadDocument	!= null	&& dlgUploadDocument.visible	) callLater( dlgUploadDocument.regetFocus );
+				//if(dlgUsers				!= null	&& dlgUsers.visible				) callLater( callLater, [dlgUsers.regetFocus] );
+				//if(dlgUser				!= null	&& dlgUser.visible				) callLater( callLater, [ callLater, [dlgUser.regetFocus] ] );
+				
+				callLater( Factory.setDialogToFront );
+				
+			}
+			
+			public function checkNoError(event:WebserviceEvent):Boolean {
+				if(event == null){
+					log('WS call empty: ' + event.type, LogFile.LEVEL_ERROR);
+					inErrorMode = true;
+					return false;
+				}
+				else if(event.datatype == WebserviceEvent.TYPE_JSONERROR){
+					// JSON parse error
+					trace(event.message);
+					trace(event.data);
+					log('WS json error, message: ' + event.message + ', data: ' + event.data, LogFile.LEVEL_ERROR);
+					inErrorMode = true;
+					//setStatus(event.message, 10);
+					return false;
+				}
+				else if(event.datatype == WebserviceEvent.TYPE_ERROR){
+					// webservice returned error
+					trace(event.message);
+					trace(event.data);
+					log('WS error, message: ' + event.message + ', data: ' + event.data, LogFile.LEVEL_ERROR);
+					inErrorMode = true;
+					//setStatus(event.message, 10);
+					return false;
+				}
+				else if(event.datatype == WebserviceEvent.TYPE_INFO){
+					// webservice returned message info
+					trace(event.message);
+					log('WS returned: ' + event.message, LogFile.LEVEL_INFO);
+					inErrorMode = false;
+					//trace(event.data);
+					return true;
+				}
+				else {
+					inErrorMode = false;
+					return true;
+				}
+			}
+			
+			
+			private function serviceFault(event:FaultEvent):void {
+				//setStatus(event.message, 10);
+				//set alternative location for ws, or if already set, show error
+				
+				inErrorMode = true;
+				
+				log('WS Error: ' + event.fault.faultDetail, LogFile.LEVEL_ERROR);
+				// host could not be initiated
+				buildTooltip(' - Error');
+				setStatus('WS Error: ' + event.fault.faultDetail, 0);
+			}
+			
+			
+			
+			private function getHost():void {
+				srv.getHost(hostName, Capabilities.os);
+			}
+			
+			private function getHostResult(event:WebserviceEvent):void {
+				if(event.data != null && event.data.length > 0){
+					user.assign(event.data[0]);
+					getSettings();
+				}
+				else {
+					inErrorMode = true;
+					log('No host configured for "'+hostName+'@'+webservicesLocation+'" or could not be found!', LogFile.LEVEL_ERROR);
+					// host could not be initiated
+					buildTooltip(' - Error');
+					setStatus('No host configured for "'+hostName+'@'+webservicesLocation+'" or could not be found!', 0);
+				}
+			}
+			
+			public function getSettings():void {
+				srv.getSettings(user.id_host);
+			}
+			
+			private function getSettingsResult(event:WebserviceEvent):void {
+				inErrorMode = false;
+				
+				var d:Array = event.data as Array;
+				d.push({
+					edittype: 'text',
+					code: 'hostName',
+					value: hostName,
+					description: 'Host name',
+					tooltip: 'The host name identifier for this PC - Must be unique',
+					editable: true,
+					category: Factory.Settings.CAT_CONNECTION
+				});
+				d.push({
+					edittype: 'text',
+					code: 'webservicesLocation',
+					value: webservicesLocation,
+					description: 'Webservices location',
+					tooltip: 'The URL where the webservices are located',
+					editable: true,
+					category: Factory.Settings.CAT_CONNECTION
+				});
+				d.push({
+					edittype: 'text',
+					code: 'webservicesLocation2',
+					value: webservicesLocation2,
+					description: 'Webservices location (backup)',
+					tooltip: 'The backup URL where the webservices are located, in case when the main location cannot be found',
+					editable: true,
+					category: Factory.Settings.CAT_CONNECTION
+				});
+				Factory.Settings.assign(d);
+				
+				//vsLogin.selectedChild = vsMain;
+				//callLater(onMainChanged);
+				
+				/*if(Factory.Settings.maximize_after_login){
+					maximize();
+				}*/
+				/*if(Factory.Settings.hide_tray_icon_while_maximized){
+					NativeApplication.nativeApplication.icon.bitmaps = [];
+				}*/
+				
+				if(Factory.Settings.log_actions && Factory.Settings.log_file_location != '' && Factory.Settings.log_file_location != null){
+					logger = new LogFile(Factory.Settings.log_file_location, Factory.Settings.log_dateformat, Factory.Settings.log_file_maxsize, Factory.Settings.log_level);
+				}
+				else {
+					logger = null;
+				}
+				
+				try {
+					if(Factory.Settings.launch_with_windows){
+						dock();
+					}
+					else {
+						undock();
+					}
+					NativeApplication.nativeApplication.startAtLogin = Factory.Settings.launch_with_windows;
+				}
+				catch(e:Error){
+					
+				}
+				
+				viewStats();
+				getShares();
+			}
+			
+			public function getShares():void {
+				//viewStats();
+				srv.getShares(user.id_host);
+			}
+			
+			private function getSharesResult(event:WebserviceEvent):void {
+				shares = new ArrayCollection;
+				sharesActive = new ArrayCollection;
+				
+				var share:Share;
+				
+				for(var i:int=0; i<event.data.length; i++){
+					share = new Share(event.data[i]);
+					shares.addItem(share);
+					if(share.id_host_share > 0){
+						sharesActive.addItem(share);
+					}
+				}
+				
+				buildTooltip();
+				vwSharesActive.load();
+			}
+			
+			private function showSettings(extraLabel:String = ''):void {
+				// initial load
+				if(Factory.Settings.data == null){
+					var d:Array = [];
+					d.push({
+						edittype: 'text',
+						code: 'hostName',
+						value: hostName,
+						description: 'Host name',
+						tooltip: 'The host name identifier for this PC - Must be unique',
+						editable: true,
+						category: Factory.Settings.CAT_CONNECTION
+					});
+					d.push({
+						edittype: 'text',
+						code: 'webservicesLocation',
+						value: webservicesLocation,
+						description: 'Webservices location',
+						tooltip: 'The URL where the webservices are located',
+						editable: true,
+						category: Factory.Settings.CAT_CONNECTION
+					});
+					d.push({
+						edittype: 'text',
+						code: 'webservicesLocation2',
+						value: webservicesLocation2,
+						description: 'Webservices location (backup)',
+						tooltip: 'The backup URL where the webservices are located, in case when the main location cannot be found',
+						editable: true,
+						category: Factory.Settings.CAT_CONNECTION
+					});
+					Factory.Settings.assign(d);
+				}
+				
+				if(dlgSettings == null){
+					dlgSettings = new Settings;
+					dlgSettings.open(true);
+					dlgSettings.nativeWindow.x = (width  - dlgSettings.width )/2;
+					dlgSettings.nativeWindow.y = (height - dlgSettings.height)/2;
+					dlgSettings.nativeWindow.width = dlgSettings.width + 20;
+					dlgSettings.nativeWindow.height = dlgSettings.height + 30;
+					dlgSettings.addEventListener('saveClick', onSettingsSaveClick, false, 0, true);
+				}
+				
+				dlgSettings.load(extraLabel);
+				
+			}
+			
+			private function onSettingsSaveClick(event:Event):void {
+				//callLater(buildMenuItems);
+				
+				getHost();
+			}
+			
+			
+			public function showShareConfig(share:Share):void {
+				if(dlgShareConfig == null){
+					dlgShareConfig = new ShareConfigDialog;
+					dlgShareConfig.open(true);
+					dlgShareConfig.nativeWindow.x = Math.max(50, (width  - dlgShareConfig.width )/2);
+					dlgShareConfig.nativeWindow.y = Math.max(50, (height - dlgShareConfig.height)/2);
+					dlgShareConfig.nativeWindow.width = dlgShareConfig.width + 20;
+					dlgShareConfig.nativeWindow.height = dlgShareConfig.height + 30;
+					dlgShareConfig.addEventListener('saveClick', onShareConfigSaveClick, false, 0, true);
+				}
+				
+				dlgShareConfig.load(share);
+				
+			}
+			
+			private function onShareConfigSaveClick(event:Event):void {
+				//callLater(buildMenuItems);
+				
+				getShares();
+			}
+			
+			
+			
+			
+			
+			//[Bindable] public var mnuTray:NativeMenuXT;
+			[Bindable] public var mnuTrayDocked:NativeMenuXT;
+			[Bindable] public var mnuTrayUndocked:NativeMenuXT;
+			public var mnuMain:NativeMenuXT;
+			
+			public var allMenuItems:String = 
+				'NewUser,NewProject,NewDeliverable,' + 
+				'DashboardCommand,ManageProjectCommand,ManagePhasesCommand,' + 
+				'ManageUsersCommand,ProfileCommand,SettingsCommand,' + 
+				'ShowAuditCommand,MyDeliverablesCommand,MyMailsCommand,' + 
+				'Separator,' + 
+				'AboutCommand'
+				;
+			
+			public function onMenuSelect(event:Event = null, _action:String = '', extraData:Object = null):void {
+				var action:String;
+				if(event is NativeMenuEvent){
+					action = (event as NativeMenuEvent).data != null ? (event as NativeMenuEvent).data.action : null;
+				}
+				else if(event != null){
+					action = event.target.data != null ? event.target.data.action : null;
+				}
+				else {
+					action = _action;
+				}
+				
+				if(action == null){
+					setStatus('Menu action is not declared! ("'+event.target.label+'")');
+				}
+				else if(action.split(' ').join('') == ''){
+					setStatus('Menu action is empty! ("'+event.target.label+'")');
+				}
+				else 
+				{
+					action = action.toLowerCase();
+					switch(action){
+						case 'exit':	exit();	break;
+						case 'dock':	dock();		break;
+						case 'undock':	undock();	break;
+						//case 'newuser':	editUser();	break;
+						case 'maximize':maximize();	break;
+						case 'minimize':minimize();	break;
+						
+						case 'openweb':
+							var u:String = getWebservicesLocation;
+							u = u.replace('/ws.php', '');
+							navigateToURL(new URLRequest(u), '_blank');
+							break;
+						
+						case 'overview':
+							//vsMain.selectedChild = vwKasOverzicht;
+							//vwKasOverzicht.load();
+							break;
+						
+						case 'do_order':
+							//vsMain.selectedChild = vwEnterOrder;
+							//vwEnterOrder.load();
+							break;
+						
+						case 'do_editorder':
+							//vsMain.selectedChild = vwEditOrder;
+							//vwEditOrder.load();
+							break;
+						
+						
+						case 'pauseall':
+							
+							break;
+						
+						case 'resumeall':
+							
+							break;
+						
+						
+						case 'mysettings':
+						case 'changesettings':
+							showSettings();
+							break;
+						
+						case 'about':
+							if(dlgAbout == null){
+								dlgAbout = new About;
+								dlgAbout.open(true);
+								dlgAbout.nativeWindow.x = (width  - dlgAbout.width )/2;
+								dlgAbout.nativeWindow.y = (height - dlgAbout.height)/2;
+							}
+							dlgAbout.load();
+							break;
+						/*
+						case 'newclassification':
+						Factory.MsgInput(Factory.Text.key('prompt_new_name_for_classification'), 'New classification', addNewClassification);
+						break;
+						*/
+						case 'setsize1024x768':
+						case 'setsize800x600':
+						case 'setsize1280x1024':
+							restore();
+							this.width	= int(action.split('setsize').join('').split('x')[0]);
+							this.height	= int(action.split('setsize').join('').split('x')[1]);
+							break;
+						
+						case 'reloadmenu':	buildMenu();		break;
+						case 'reloadicons':	buildMenuItems();	break;
+						
+						default:
+							setStatus('Menu action is not implemented: ' + action + ' ("'+event.target.label+'")');
+					}
+				}
+			}
+			
+			public function buildMenu():void {
+				//Setting a window menu:
+				mnuMain = new NativeMenuXT( readXmlFile('data/main_menu.xml') );
+				mnuTrayDocked = new NativeMenuXT( readXmlFile('data/traymenu_invisible.xml') );
+				mnuTrayUndocked = new NativeMenuXT( readXmlFile('data/traymenu_visible.xml') );
+				/*if(user.debugger || runningLocal){
+				mnuMain.addChildren( readXmlFile('data/main_menu_debug.xml') );
+				}*/
+				
+				nativeWindow.menu = mnuMain;
+				//nativeWindow.menu.addEventListener(Event.DISPLAYING, onMenuDisplaying, false, 0, true);//Event.DISPLAYING is not dispatched
+				nativeWindow.menu.addEventListener(Event.SELECT, onMenuSelect, false, 0, true);
+				
+				buildMenuItems();
+				
+				
+			}			
+			
+			
+			public function updateMenuItems():void {
+				trace('updateMenuItems');
+				
+				if(mnuMain != null && mnuMain.getMenuItemById('LogoutCommand') != null) mnuMain.getMenuItemById('LogoutCommand').enabled = user.id_host > 0;
+				
+				if(mnuMain != null && mnuMain.getMenuItemById('EnterDepositCommand') != null) mnuMain.getMenuItemById('EnterDepositCommand').enabled = true;//user.allow_editdeposits;
+				if(mnuMain != null && mnuMain.getMenuItemById('EditOrderCommand') != null) mnuMain.getMenuItemById('EditOrderCommand').enabled = true;//user.allow_editorders;
+				
+				if(mnuMain != null && mnuMain.getMenuItemById('KassaOverviewCommand') != null) mnuMain.getMenuItemById('KassaOverviewCommand').enabled = true;//user.allow_overview;
+				if(mnuMain != null && mnuMain.getMenuItemById('EnterOrderCommand') != null) mnuMain.getMenuItemById('EnterOrderCommand').enabled = true;//user.allow_order;
+				
+			}
+			
+			private function buildMenuItems():void {
+				trace('buildMenuItems');
+				
+				/*boxIcons.removeAllChildren();
+				var customMenuIcon:MenuButton;
+				for(var i:int=0; i<user.menu_items.length; i++){
+				
+				// if menu item from user exists, e.g. if it is in 'allMenuItems'
+				if( String( ',' + allMenuItems + ',' ).indexOf( ',' + user.menu_items[i] + ',' ) != -1 ){
+				
+				customMenuIcon = new MenuButton;
+				if(user.menu_items[i] != 'Separator')
+				customMenuIcon.menuName = user.menu_items[i];
+				else
+				customMenuIcon.isSeparator = true;
+				boxIcons.addChild( customMenuIcon );
+				}
+				}*/
+				updateMenuItems();
+			}
+			
+			
+			
+			
+			
+			// Menu items
+			
+			public function viewLog():void {
+				vs.selectedChild = vwLog;
+				callLater(vwLog.load);
+			}
+			
+			public function viewStats():void {
+				vs.selectedChild = vwStats;
+				callLater(vwStats.load);
+			}
+			
+			public function viewSharesActive():void {
+				vs.selectedChild = vwSharesActive;
+				//callLater(vwSharesActive.load);
+			}
+			
+			public function viewSharesAll():void {
+				vs.selectedChild = vwSharesOverview;
+				//callLater(vwSharesOverview.load);
+			}
+			
+			
+			/*
+			private function helloResult(event:ResultEvent):void {
+				
+			}
+			private function helloFault(event:FaultEvent):void {
+				
+			}
+			*/
+			
+			
+			
+			
+			public function buildTooltip(extra:String = ''):void {
+				var t:String = applicationName;
+				var st:String = '';
+				
+				t += '';
+				
+				if(extra != ''){
+					t += extra;
+				}
+				
+				var running:Boolean = false;
+				
+				var replIndex:int = -1;
+				if(SystemTrayIcon(nativeApplication.icon).menu != null){
+					
+					for(var m:int=SystemTrayIcon(nativeApplication.icon).menu.numItems - 1; m>=0; m--){
+						if(
+							SystemTrayIcon(nativeApplication.icon).menu.items[m] is NativeMenuItem 
+							&&
+							(SystemTrayIcon(nativeApplication.icon).menu.items[m] as NativeMenuItem).data != null
+							&& 
+							(SystemTrayIcon(nativeApplication.icon).menu.items[m] as NativeMenuItem).data.hasOwnProperty('action')
+							&&
+							(SystemTrayIcon(nativeApplication.icon).menu.items[m] as NativeMenuItem).data.action == 'status'
+						){
+							//if(replIndex < 0){
+								replIndex = m;
+							//}
+							
+							SystemTrayIcon(nativeApplication.icon).menu.removeItemAt(m);
+							
+						}
+					}
+					
+					var item:NativeMenuItem, l:String;
+					if(replIndex >= 0){
+						
+						if(sharesActive.length > 0){
+							st += '[';
+						}
+						
+						for(var s:int=0; s<sharesActive.length; s++){
+							l = sharesActive[s].name;
+							l += ': ';
+							
+							for(var v:int=0; v<vwSharesActive.numChildren; v++){
+								if(vwSharesActive.getChildAt(v) is ShareProcessIndex && (vwSharesActive.getChildAt(v) as ShareProcessIndex).share.id_share == sharesActive[s].id_share){
+									l += (vwSharesActive.getChildAt(v) as ShareProcessIndex).lblStatus.text;
+									
+									if((vwSharesActive.getChildAt(v) as ShareProcessIndex).currentStep != ShareProcessIndex.STEP_IDLE){
+										st += (s > 0 ? ', ' : '') + sharesActive[s].name;
+										running = true;
+									}
+									/*else {
+										l += 'Not running';
+									}*/
+									
+									if( (vwSharesActive.getChildAt(v) as ShareProcessIndex).pbManual.visible ){
+										l += ' (' + (vwSharesActive.getChildAt(v) as ShareProcessIndex).pbManual.label.replace('File ', '') + ')';
+										st += ' ' + (vwSharesActive.getChildAt(v) as ShareProcessIndex).pbManual.label.replace('File ', '').replace(' of ', '/') + '';
+									}
+									/*else if((vwSharesActive.getChildAt(v) as ShareProcessIndex).currentStep == ShareProcessIndex.STEP_GETINDEX){
+										l += ' (Indexing...)';
+									}*/
+									
+								}
+							}
+							
+							item = new NativeMenuItem(l);
+							item.label = l;
+							item.enabled = false;
+							item.data = {action: 'status'};
+							item.name = 'status'+s;
+							SystemTrayIcon(nativeApplication.icon).menu.addItemAt(item, replIndex);
+						}
+						if(sharesActive.length > 0){
+							st += ']';
+						}
+					}
+					else {
+						item = new NativeMenuItem('Loading...');
+						item.label = 'Loading...';
+						item.enabled = false;
+						item.data = {action: 'status'};
+						item.name = 'statusl';
+						SystemTrayIcon(nativeApplication.icon).menu.addItemAt(item, 3);
+					}
+					
+				}
+				
+				isSharesRunning = running;
+				if(running){
+					if(runningTimer && !runningTimer.running){
+						//runningTimer.start();
+					}
+				}
+				else {
+					runningTimerIndex = 0;
+					trayIcon = inErrorMode ? trayIconError : trayIconMain;
+					if(runningTimer && runningTimer.running){
+						//runningTimer.stop();
+					}
+				}
+				
+				trayToolTip = t + (st == '' || st == '[]' ? '' : ' ' + st);
+			}
+			
+			private function runningTimerTick(event:TimerEvent):void {
+				if(isSharesRunning){
+					runningTimerIndex++;
+					if(runningTimerIndex > 16){
+						runningTimerIndex = 1;
+					}
+					trayIcon = trayIconsRunning.length > runningTimerIndex-1 ? trayIconsRunning[runningTimerIndex-1] : ('images/embedded/16/sync_running_f' + (runningTimerIndex < 10 ? '0' : '') + runningTimerIndex + '.png');
+				}
+				
+				var now:Date = new Date;
+				
+				for(var s:int=0; s<sharesActive.length; s++){
+					for(var v:int=0; v<vwSharesActive.numChildren; v++){
+						if(vwSharesActive.getChildAt(v) is ShareProcessIndex && (vwSharesActive.getChildAt(v) as ShareProcessIndex).share.id_share == sharesActive[s].id_share){
+							
+							if(
+								(vwSharesActive.getChildAt(v) as ShareProcessIndex).currentStep == ShareProcessIndex.STEP_IDLE
+								&&
+								(vwSharesActive.getChildAt(v) as ShareProcessIndex).share.date_next_run != null
+								&&
+								(vwSharesActive.getChildAt(v) as ShareProcessIndex).share.date_next_run.time <= now.time
+							){
+								(vwSharesActive.getChildAt(v) as ShareProcessIndex).start();
+							}
+							
+						}
+					}
+				}
+			}
+			
+			
+		]]>
+	</mx:Script>
+	
+	<mx:Style source="styles/default.css"/>
+	
+	<!--
+	<mx:RemoteObject id="srvFilerep" destination="amfphp" source="VoService" 
+					 showBusyCursor="true"
+					 >
+		<mx:method name="sayHello" result="helloResult(event)" fault="helloFault(event)"/>
+	</mx:RemoteObject>
+	-->
+	
+	<ws:WebService id="srv" location="{getWebservicesLocation}" fault="serviceFault(event)" 
+				   getHost="if(checkNoError(event)) getHostResult(event)"
+				   getSettings="if(checkNoError(event)) getSettingsResult(event)"
+				   getShares="if(checkNoError(event)) getSharesResult(event)"
+				   />
+	
+	<mx:HBox width="100%">
+		<mx:LinkButton label="Stats" click="viewStats()" 
+					   enabled="{vs.selectedChild != boxInitial}" 
+					   icon="{Icons.pie_chart_48}" labelPlacement="bottom"/>
+		
+		<mx:Canvas width="1" height="100%" backgroundColor="#CCCCCC"/>
+		
+		<mx:LinkButton label="Active shares" click="viewSharesActive()" 
+					   enabled="{vs.selectedChild != boxInitial}" 
+					   icon="{Icons.window_sync_checked_48}" labelPlacement="bottom"/>
+		<mx:LinkButton label="All shares" click="viewSharesAll()" 
+					   enabled="{vs.selectedChild != boxInitial}" 
+					   icon="{Icons.window_sync_48}" labelPlacement="bottom"/>
+		
+		<mx:Canvas width="1" height="100%" backgroundColor="#CCCCCC"/>
+		
+		<mx:LinkButton label="Log" click="viewLog()" 
+					   enabled="{vs.selectedChild != boxInitial}" 
+					   icon="{Icons.document_time_48}" labelPlacement="bottom"/>
+		
+		<mx:Canvas width="1" height="100%" backgroundColor="#CCCCCC"/>
+		
+		<mx:LinkButton label="Settings" click="showSettings()" 
+					   enabled="{vs.selectedChild != boxInitial || inErrorMode}" 
+					   icon="{Icons.gears_preferences_48}" labelPlacement="bottom"/>
+	</mx:HBox>
+	
+	<mx:Canvas width="100%" height="1" backgroundColor="#960202"/>
+	
+	<xt:ViewStackXT id="vs" width="100%" height="100%" creationPolicy="all">
+		<mx:HBox id="boxInitial" horizontalAlign="center" verticalAlign="middle">
+			<mx:Label text="Initializing..."/>
+		</mx:HBox>
+		
+		<views:StatsView id="vwStats"/>
+		
+		<views:SharesActive id="vwSharesActive"/>
+		<views:SharesOverview id="vwSharesOverview"/>
+		
+		<views:LogView id="vwLog"/>
+	</xt:ViewStackXT>
+	
+	<!--mx:HBox width="100%">
+		<mx:Label text="WS: {getWebservicesLocation}" fontSize="8"/>
+	</mx:HBox-->
+	
+</core:WindowedApplicationXT>
